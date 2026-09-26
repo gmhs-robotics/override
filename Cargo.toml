@@ -6,11 +6,7 @@ publish = false
 
 [dependencies]
 ozton = { path = "../ozton/packages/ozton", version = "0.4.0" }
-vexide = { version = "0.8.0", features = ["full", "default-sdk"] }
-
-[patch.crates-io]
-vex-sdk-jumptable = { path = "../ozton/vendor/vex-sdk-jumptable" }
-vex-sdk-mock = { path = "../ozton/vendor/vex-sdk-mock" }
+vexide = { version = "=0.9.0-alpha.1", features = ["full", "default-sdk"] }
 
 [package.metadata.v5]
 upload-strategy = "differential"
