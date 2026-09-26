@@ -1,0 +1,22 @@
+[package]
+name = "override-competition"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ozton = { path = "../ozton/packages/ozton", version = "0.4.0" }
+vexide = { version = "0.8.0", features = ["full", "default-sdk"] }
+
+[patch.crates-io]
+vex-sdk-jumptable = { path = "../ozton/vendor/vex-sdk-jumptable" }
+vex-sdk-mock = { path = "../ozton/vendor/vex-sdk-mock" }
+
+[package.metadata.v5]
+upload-strategy = "differential"
+slot = 1
+compress = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
