@@ -1,162 +1,112 @@
+#![deny(dead_code)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
+mod mechanism_control;
+mod mechanisms;
+mod pivot_control;
+mod recovery;
+mod resilient_drive;
+
 use std::{
     cell::Cell,
     rc::Rc,
     time::{Duration, Instant},
 };
 
+use mechanism_control::Calibration;
+use mechanisms::{MechanismFrame, Mechanisms};
 use ozton::{
-    control::{drive::AntiTip, lift::LiftProfile, loops::Pid},
     derive::RecordedRobot,
     drivetrain::{
         Drivetrain,
-        model::{CoupledDifferential, DriveMotor, Tank, TipAngleAxis},
+        model::{CoupledDifferential, DriveMotor, Tank},
     },
     record::{
-        self, DifferentialVoltageFrame, RecordField, RecordableDrivetrain,
-        frame::{PlaybackOutcome, RecordMode},
-        lift::{LiftFrame, MirroredLift},
+        self, DifferentialVoltageFrame, RecordableDrivetrain,
+        frame::PlaybackOutcome,
         runtime::{PlaybackAutonomous, RecordingAutonomous},
     },
-    tracking::wheeled::{TrackingWheel, WheeledTracking},
+    tracking::NoTracking,
 };
-use vexide::adi::digital::LogicLevel;
+use resilient_drive::ResilientDrive;
 use vexide::{
     color::Color,
     display::{Display, Font, FontFamily, FontSize, Rect, Text, TouchState},
-    math::Angle,
     prelude::*,
-    smart::PortError,
     time::sleep,
 };
 
-// ROBOT CONFIGURATION: replace provisional measurements and signs after commissioning.
+// Competition robot configuration.
 const CONTROL_INTERVAL: Duration = Duration::from_millis(10);
-const TRACKING_WHEEL_DIAMETER_M: f64 = 0.0508; // provisional 2 inches; confirm tread diameter
-// X increases forward; Y increases left. Only perpendicular coordinate affects each wheel.
-const FORWARD_SENSOR_Y_M: f64 = 0.00635; // 1/4 inch left
-const SIDEWAYS_SENSOR_X_M: f64 = -0.0762; // 3 inches behind
-const FORWARD_WHEEL_DIRECTION: Direction = Direction::Forward;
-const SIDEWAYS_WHEEL_DIRECTION: Direction = Direction::Forward;
 const ELEVEN_W_WHEEL_PER_MOTOR_REV: f64 = 36.0 / 48.0;
-const FIVE_POINT_FIVE_W_WHEEL_PER_MOTOR_REV: f64 = 1.0; // verify compound stage
-const TIP_THRESHOLD_RADIANS: f64 = 0.16;
-const TIP_PID: (f64, f64, f64) = (1.35, 0.0, 0.03);
-const TIP_POLARITY: f64 = -1.0; // sensor roll positive when nose tips down
-const TIP_MAXIMUM_CORRECTION: f64 = 0.35;
-const CLAW_HIGH_IS_OPEN: bool = false; // observed low output opens the claw
-const CLAW_OPEN_ON_BOOT: bool = false;
+const FIVE_POINT_FIVE_W_WHEEL_PER_MOTOR_REV: f64 = 1.0;
 const RECORD_DRIVE_LIMIT: f64 = 0.45;
-const LIFT_BOTTOM_DEGREES: f64 = 30.0;
-const LIFT_TOP_DEGREES: f64 = 600.0;
-const LIFT_UP_MAXIMUM_COMMAND: f64 = 0.75;
-const LIFT_DOWN_MAXIMUM_COMMAND: f64 = 0.33;
-const LIFT_UP_RISE_PER_SECOND: f64 = 1.5;
-const LIFT_DOWN_RISE_PER_SECOND: f64 = 0.9;
-const LIFT_POSITION_GAIN: f64 = 0.01;
+const DRIVE_OUTPUT_SCALE: f64 = 0.70;
+const FIRMWARE_LABEL: &str = "OVERRIDE P9 PIVOT";
+// Pivot follows twice the original 145/135 shaft-to-lift ratio.
+// It reaches 90 output degrees at about -167.59 lift encoder degrees.
+// Start with the lift at zero and the intake stowed so startup references match the mechanism.
+// Pivot feedback uses the rotation sensor on the motor shaft, before external gearing.
+const MECHANISM_CALIBRATION: Calibration = Calibration {
+    lift_bottom_degrees: 0.0,
+    lift_top_degrees: 1800.0,
+    lift_rotated_degrees: 135.0 * 360.0 / (145.0 * 2.0),
+    pivot_home_degrees: 0.0,
+    // One tooth on the 12T shaft: 30 shaft degrees / 4 = 7.5 intake degrees.
+    pivot_alignment_output_degrees: (360.0 / 12.0) / (48.0 / 12.0),
+    pivot_travel_output_degrees: 90.0,
+    pivot_motor_per_output_rev: 48.0 / 12.0, // 12T motor gear drives the 48T intake gear
+};
 const BOOT_SELECT_TIMEOUT: Duration = Duration::from_secs(4);
 const OFF_WALL_DRIVE_POWER: f64 = 0.35;
 const OFF_WALL_DRIVE_TIME: Duration = Duration::from_millis(750);
-const TOGGLE_MOTOR_RPM: i32 = 100;
-const TOGGLE_MOVE_TIMEOUT: Duration = Duration::from_secs(3);
-const TOGGLE_POSITION_TOLERANCE_DEGREES: f64 = 8.0;
-const TOGGLE_PAUSE: Duration = Duration::from_millis(250);
-const TOGGLE_STALL_WINDOW: Duration = Duration::from_millis(400);
-const TOGGLE_MIN_PROGRESS_DEGREES: f64 = 5.0;
 
-type RobotDrive = RecordableDrivetrain<CoupledDifferential, WheeledTracking>;
-
-struct PneumaticClaw {
-    output: AdiDigitalOut,
-}
-
-#[record::async_trait(?Send)]
-impl RecordField for PneumaticClaw {
-    type Output = bool;
-
-    async fn apply_frame_value(&mut self, open: &bool, _: RecordMode) -> Result<(), PortError> {
-        self.output.set_level(if *open == CLAW_HIGH_IS_OPEN {
-            LogicLevel::High
-        } else {
-            LogicLevel::Low
-        })
-    }
-}
+type RobotDrive = RecordableDrivetrain<ResilientDrive, NoTracking>;
 
 #[derive(RecordedRobot)]
 struct Robot {
     #[record(skip)]
     controller: Controller,
     #[record(skip)]
-    claw_open: Cell<bool>,
-    #[record(skip)]
-    imu_calibrated: bool,
-    #[record(skip)]
     record_mode: bool,
+    #[record(skip)]
+    drive_boost: Rc<Cell<bool>>,
     drivetrain: RobotDrive,
-    lift: MirroredLift,
-    pneumatic_claw: PneumaticClaw,
-    auxiliary_motor: Motor,
+    mechanisms: Mechanisms,
 }
 
 #[record::async_trait(?Send)]
 impl record::Recordable for Robot {
     const UPDATE_INTERVAL: Duration = CONTROL_INTERVAL;
     const PREDETERMINED_ROUTE_NAME: Option<&'static str> = Some("Move Off Wall");
-    // Hidden until the mechanism's safe motor travel is measured. Both routes
-    // currently request 180 degrees, which exceeds the observed hard stop.
-    const ADDITIONAL_PREDETERMINED_ROUTE_NAMES: &'static [&'static str] = &[];
 
     async fn run_predetermined_route(&mut self) -> PlaybackOutcome {
-        if self
-            .drivetrain
-            .model
-            .drive_tank(OFF_WALL_DRIVE_POWER, OFF_WALL_DRIVE_POWER)
-            .is_err()
-        {
-            self.on_playback_abort().await;
-            return PlaybackOutcome::OutputFailed;
+        // Reissue the current command so motors that reconnect during the route join in.
+        let start = Instant::now();
+        while start.elapsed() < OFF_WALL_DRIVE_TIME {
+            let _ = self
+                .drivetrain
+                .model
+                .drive_tank(OFF_WALL_DRIVE_POWER, OFF_WALL_DRIVE_POWER);
+            sleep(CONTROL_INTERVAL).await;
         }
-
-        sleep(OFF_WALL_DRIVE_TIME).await;
-        if self.drivetrain.model.coast_now().is_err() {
-            self.on_playback_abort().await;
-            return PlaybackOutcome::OutputFailed;
-        }
-        PlaybackOutcome::Completed
-    }
-
-    async fn run_additional_predetermined_route(&mut self, index: usize) -> PlaybackOutcome {
-        let half_turns = match index {
-            0 => 2,
-            1 => 1,
-            _ => return PlaybackOutcome::OutputFailed,
-        };
-
-        for half_turn in 0..half_turns {
-            match self.turn_toggle_motor(-180.0).await {
-                Ok(true) => {}
-                Ok(false) | Err(_) => {
-                    self.on_playback_abort().await;
-                    return PlaybackOutcome::OutputFailed;
-                }
-            }
-            if half_turn + 1 < half_turns {
-                sleep(TOGGLE_PAUSE).await;
-            }
-        }
-
-        if self.auxiliary_motor.set_voltage(0.0).is_err() {
-            self.on_playback_abort().await;
-            return PlaybackOutcome::OutputFailed;
-        }
+        let _ = self.drivetrain.model.coast_now();
         PlaybackOutcome::Completed
     }
 
     async fn get_new_frame(&self) -> Self::Frame {
+        // A controller read failure produces neutral commands; retry on the next control tick.
         let state = self.controller.state().unwrap_or_default();
-        if state.button_l1.is_now_pressed() {
-            self.claw_open.set(!self.claw_open.get());
-        }
+        let boost = state.button_y.is_pressed();
+        self.drive_boost.set(boost);
+        let input_limit = if self.record_mode && !boost {
+            RECORD_DRIVE_LIMIT
+        } else {
+            1.0
+        };
         let direction = match (state.button_r1.is_pressed(), state.button_r2.is_pressed()) {
             (true, false) => 1,
             (false, true) => -1,
@@ -164,89 +114,33 @@ impl record::Recordable for Robot {
         };
         Self::Frame {
             drivetrain: DifferentialVoltageFrame::arcade(
-                state.left_stick.y()
-                    * if self.record_mode {
-                        RECORD_DRIVE_LIMIT
-                    } else {
-                        1.0
-                    },
-                state.right_stick.x()
-                    * if self.record_mode {
-                        RECORD_DRIVE_LIMIT
-                    } else {
-                        1.0
-                    },
+                state.left_stick.y() * input_limit,
+                state.right_stick.x() * input_limit,
             ),
-            lift: LiftFrame {
-                direction,
-                position_degrees: 0.0,
-            },
-            pneumatic_claw: self.claw_open.get(),
-            auxiliary_motor: if state.button_x.is_pressed() {
-                -1.0
-            } else {
-                0.0
+            mechanisms: MechanismFrame {
+                lift_direction: direction,
+                pivot_raise: state.button_up.is_pressed() || state.button_x.is_pressed(),
+                pivot_lower: state.button_down.is_pressed() || state.button_a.is_pressed(),
+                pivot_trim_output_degrees: 0.0,
+                intake_direction: match (state.button_l1.is_pressed(), state.button_l2.is_pressed())
+                {
+                    (true, false) => 1,
+                    (false, true) => -1,
+                    _ => 0,
+                },
+                lift_position_degrees: 0.0,
             },
         }
-    }
-
-    fn playback_ready(&self) -> bool {
-        self.imu_calibrated && self.drivetrain.tracking.is_ready()
     }
 
     async fn on_playback_abort(&mut self) {
         let _ = self.drivetrain.model.coast_now();
-        let _ = self.lift.hold();
-        let _ = self.auxiliary_motor.set_voltage(0.0);
+        self.mechanisms.hold();
     }
 
     async fn on_save(&mut self) {
+        // Saving already succeeded. Missing rumble feedback does not invalidate the saved route.
         let _ = self.controller.rumble(".").await;
-    }
-}
-
-impl Robot {
-    async fn turn_toggle_motor(&mut self, degrees: f64) -> Result<bool, PortError> {
-        let target = self.auxiliary_motor.position()? + Angle::from_degrees(degrees);
-        self.auxiliary_motor
-            .set_position_target(target, TOGGLE_MOTOR_RPM)?;
-        let start = Instant::now();
-        let mut progress_start = start;
-        let mut previous_error = degrees.abs();
-        loop {
-            let error = (target - self.auxiliary_motor.position()?)
-                .as_degrees()
-                .abs();
-            if error <= TOGGLE_POSITION_TOLERANCE_DEGREES {
-                self.auxiliary_motor.set_voltage(0.0)?;
-                return Ok(true);
-            }
-            if start.elapsed() >= TOGGLE_MOVE_TIMEOUT {
-                self.auxiliary_motor.set_voltage(0.0)?;
-                return Ok(false);
-            }
-            if progress_start.elapsed() >= TOGGLE_STALL_WINDOW {
-                if previous_error - error < TOGGLE_MIN_PROGRESS_DEGREES {
-                    self.auxiliary_motor.set_voltage(0.0)?;
-                    return Ok(false);
-                }
-                previous_error = error;
-                progress_start = Instant::now();
-            }
-            sleep(CONTROL_INTERVAL).await;
-        }
-    }
-}
-
-fn lift_profile() -> LiftProfile {
-    LiftProfile {
-        bottom_degrees: LIFT_BOTTOM_DEGREES,
-        top_degrees: LIFT_TOP_DEGREES,
-        up_maximum_command: LIFT_UP_MAXIMUM_COMMAND,
-        down_maximum_command: LIFT_DOWN_MAXIMUM_COMMAND,
-        up_rise_per_second: LIFT_UP_RISE_PER_SECOND,
-        down_rise_per_second: LIFT_DOWN_RISE_PER_SECOND,
-        position_gain: LIFT_POSITION_GAIN,
     }
 }
 
@@ -261,6 +155,11 @@ async fn choose_record_mode(display: &mut Display) -> bool {
         Color::BLACK,
     );
     let font = Font::new(FontSize::MEDIUM, FontFamily::Proportional);
+    display.draw_text(
+        &Text::from_string(FIRMWARE_LABEL, font, [16, 20]),
+        Color::WHITE,
+        None,
+    );
     display.draw_text(
         &Text::from_string("Touch upper half: RECORD", font, [16, 52]),
         Color::WHITE,
@@ -307,108 +206,89 @@ async fn choose_record_mode(display: &mut Display) -> bool {
     record_mode
 }
 
-#[vexide::main]
-async fn main(peripherals: Peripherals) {
+// Match vexide's default code signature and startup, without the entrypoint
+// macro's generated `Peripherals::take().unwrap()`.
+#[cfg_attr(target_os = "vexos", unsafe(link_section = ".code_signature"))]
+#[used]
+#[unsafe(no_mangle)]
+static __VEXIDE_CODE_SIGNATURE: vexide::program::CodeSignature =
+    vexide::program::CodeSignature::new(
+        vexide::program::ProgramType::User,
+        vexide::program::ProgramOwner::Partner,
+        vexide::program::ProgramOptions::empty(),
+    );
+
+fn main() {
+    // SAFETY: Called once at the program entrypoint, before using VEX devices.
+    unsafe { vexide::startup::startup() };
+    vexide::startup::banner::print(vexide::startup::banner::themes::THEME_DEFAULT);
+    vexide::runtime::block_on(async {
+        loop {
+            if let Some(peripherals) = Peripherals::take() {
+                run(peripherals).await;
+            }
+            sleep(CONTROL_INTERVAL).await;
+        }
+    });
+}
+
+async fn run(peripherals: Peripherals) {
+    println!(
+        "{FIRMWARE_LABEL}: drive L5/4/3 R20/19/18; lift P1; roller P2; intake P10; pivot P9; rotation P8"
+    );
     let mut display = peripherals.display;
     let record_mode = choose_record_mode(&mut display).await;
 
-    // IMU: sensor Y points forward and sensor Z points down. Smart port 15.
-    // Raw heading decreases CCW; ozton's Gyro adapter converts it to CCW-positive.
-    let mut imu = InertialSensor::new(peripherals.port_15);
-    let imu_ready = imu.calibrate().await.is_ok();
-    if !imu_ready {
-        println!("IMU calibration failed; recording and playback unavailable");
-    }
-    let imu = Rc::new(imu);
-
-    // Rotation sensors: forward wheel on P1, sideways wheel on P10.
-    let tracking = WheeledTracking::new(
-        [0.0, 0.0],
-        Angle::ZERO,
-        [TrackingWheel::new(
-            RotationSensor::new(peripherals.port_1, FORWARD_WHEEL_DIRECTION),
-            TRACKING_WHEEL_DIAMETER_M,
-            FORWARD_SENSOR_Y_M,
-            None,
-        )],
-        [TrackingWheel::new(
-            RotationSensor::new(peripherals.port_10, SIDEWAYS_WHEEL_DIRECTION),
-            TRACKING_WHEEL_DIAMETER_M,
-            -SIDEWAYS_SENSOR_X_M,
-            None,
-        )],
-        Some(imu.clone()),
-    );
-
     let left = [
         DriveMotor::new(
-            Motor::new_exp(peripherals.port_12, Direction::Reverse),
+            Motor::new_exp(peripherals.port_5, Direction::Reverse),
             FIVE_POINT_FIVE_W_WHEEL_PER_MOTOR_REV,
         ),
         DriveMotor::new(
-            Motor::new(peripherals.port_13, Gearset::Blue, Direction::Reverse),
+            Motor::new(peripherals.port_4, Gearset::Blue, Direction::Reverse),
             ELEVEN_W_WHEEL_PER_MOTOR_REV,
         ),
         DriveMotor::new(
-            Motor::new(peripherals.port_11, Gearset::Blue, Direction::Reverse),
+            Motor::new(peripherals.port_3, Gearset::Blue, Direction::Reverse),
             ELEVEN_W_WHEEL_PER_MOTOR_REV,
         ),
     ];
     let right = [
         DriveMotor::new(
-            Motor::new_exp(peripherals.port_19, Direction::Forward),
+            Motor::new_exp(peripherals.port_20, Direction::Forward),
             FIVE_POINT_FIVE_W_WHEEL_PER_MOTOR_REV,
+        ),
+        DriveMotor::new(
+            Motor::new(peripherals.port_19, Gearset::Blue, Direction::Forward),
+            ELEVEN_W_WHEEL_PER_MOTOR_REV,
         ),
         DriveMotor::new(
             Motor::new(peripherals.port_18, Gearset::Blue, Direction::Forward),
             ELEVEN_W_WHEEL_PER_MOTOR_REV,
         ),
-        DriveMotor::new(
-            Motor::new(peripherals.port_20, Gearset::Blue, Direction::Forward),
-            ELEVEN_W_WHEEL_PER_MOTOR_REV,
-        ),
     ];
-    let mut model = CoupledDifferential::new_direct_voltage(left, right);
-    if imu_ready {
-        match imu.euler() {
-            Ok(angles) => {
-                let (kp, ki, kd) = TIP_PID;
-                model = model.with_anti_tip_axis(
-                    imu.clone(),
-                    AntiTip::new(
-                        Pid::new(kp, ki, kd, None),
-                        TIP_THRESHOLD_RADIANS,
-                        TIP_POLARITY,
-                        TIP_MAXIMUM_CORRECTION,
-                    ),
-                    TipAngleAxis::Roll,
-                    angles.c,
-                );
-            }
-            Err(error) => println!("Anti-tip disabled: IMU roll unavailable: {error:?}"),
-        }
-    }
-
-    let claw_level = if CLAW_OPEN_ON_BOOT == CLAW_HIGH_IS_OPEN {
-        LogicLevel::High
-    } else {
-        LogicLevel::Low
-    };
+    let model =
+        CoupledDifferential::new_direct_voltage(left, right).with_output_scale(DRIVE_OUTPUT_SCALE);
+    let drive_boost = Rc::new(Cell::new(false));
     let robot = Robot {
         controller: peripherals.primary_controller,
-        claw_open: Cell::new(CLAW_OPEN_ON_BOOT),
-        imu_calibrated: imu_ready,
         record_mode,
-        drivetrain: RecordableDrivetrain::new(Drivetrain::new(model, tracking)),
-        lift: MirroredLift::new(
-            Motor::new(peripherals.port_17, Gearset::Green, Direction::Reverse),
-            Motor::new(peripherals.port_14, Gearset::Green, Direction::Forward),
-            lift_profile(),
+        drive_boost: drive_boost.clone(),
+        drivetrain: RecordableDrivetrain::new(Drivetrain::new(
+            ResilientDrive::new(model, drive_boost, DRIVE_OUTPUT_SCALE),
+            NoTracking,
+        )),
+        mechanisms: Mechanisms::new(
+            Motor::new(peripherals.port_1, Gearset::Red, Direction::Forward),
+            Motor::new_exp(peripherals.port_9, Direction::Reverse),
+            // P10 main intake: forward draws pins inward.
+            Motor::new_exp(peripherals.port_10, Direction::Forward),
+            // P2 match-load roller: reversed wiring; loading direction is logical reverse.
+            Motor::new(peripherals.port_2, Gearset::Green, Direction::Reverse),
+            // Raw P8 increases downward; expose positive upward travel to control.
+            RotationSensor::new(peripherals.port_8, Direction::Reverse),
+            MECHANISM_CALIBRATION,
         ),
-        pneumatic_claw: PneumaticClaw {
-            output: AdiDigitalOut::with_initial_level(peripherals.adi_a, claw_level),
-        },
-        auxiliary_motor: Motor::new_exp(peripherals.port_16, Direction::Forward),
     };
 
     if record_mode {
