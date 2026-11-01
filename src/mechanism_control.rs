@@ -2,20 +2,13 @@
 //! encoder; pivot angles use P8 shaft rotation, except named intake output angles.
 //! Lift control uses positive upward travel, converted at the device boundary.
 
-// Leave clearance and taper power before the mechanical hard stop.
-pub const LIFT_TOP_CLEARANCE_DEGREES: f64 = 30.0;
-pub const LIFT_MAXIMUM_DEGREES: f64 = 1100.0;
-/// The cascade raises toward negative motor encoder positions, down to -1100 degrees.
-pub const LIFT_RAISE_DIRECTION: f64 = -1.0;
-pub const LIFT_UP_SLOWDOWN_DEGREES: f64 = 100.0;
-pub const LIFT_DOWN_SLOWDOWN_DEGREES: f64 = 180.0;
-pub const LIFT_UP_MAXIMUM_COMMAND: f64 = 1.0;
-pub const LIFT_DOWN_MAXIMUM_COMMAND: f64 = 0.35;
-pub const LIFT_UP_APPROACH_COMMAND: f64 = 0.12;
-pub const LIFT_DOWN_APPROACH_COMMAND: f64 = 0.08;
-/// Match-loading is allowed only near the bottom and with the pivot near stowed.
-pub const MATCH_LOAD_LIFT_TOLERANCE_DEGREES: f64 = 50.0;
-pub const MATCH_LOAD_PIVOT_TOLERANCE_OUTPUT_DEGREES: f64 = 10.0;
+pub use crate::config::{
+    LIFT_DOWN_APPROACH_COMMAND, LIFT_DOWN_MAXIMUM_COMMAND, LIFT_DOWN_SLOWDOWN_DEGREES,
+    LIFT_ENDPOINT_TOLERANCE_DEGREES, LIFT_MAXIMUM_DEGREES, LIFT_RAISE_DIRECTION,
+    LIFT_TOP_CLEARANCE_DEGREES, LIFT_UP_APPROACH_COMMAND, LIFT_UP_MAXIMUM_COMMAND,
+    LIFT_UP_SLOWDOWN_DEGREES, MATCH_LOAD_LIFT_TOLERANCE_DEGREES,
+    MATCH_LOAD_PIVOT_TOLERANCE_OUTPUT_DEGREES,
+};
 
 /// Brief inward roller assistance when a new raise begins near the bottom.
 /// Releasing, lowering, or ejecting cancels it; holding Raise never retriggers it.
@@ -42,7 +35,7 @@ impl DepartureRollerPulse {
         if !raising || ejecting {
             self.cancel();
         } else if starting {
-            self.remaining = std::time::Duration::from_millis(600);
+            self.remaining = crate::config::DEPARTURE_PULSE_TIME;
         } else {
             self.remaining = self.remaining.saturating_sub(elapsed);
         }
@@ -67,7 +60,7 @@ pub fn match_load_roller_direction(
         && pivot.is_finite()
         && (lift - calibration.lift_bottom_degrees).abs() <= MATCH_LOAD_LIFT_TOLERANCE_DEGREES
         && (pivot - calibration.pivot_home_degrees).abs()
-            <= MATCH_LOAD_PIVOT_TOLERANCE_OUTPUT_DEGREES * calibration.pivot_motor_per_output_rev
+            <= MATCH_LOAD_PIVOT_TOLERANCE_OUTPUT_DEGREES * calibration.pivot_sensor_per_output_rev
     {
         -intake_request.signum()
     } else {
@@ -83,12 +76,10 @@ pub struct Calibration {
     /// Lift encoder position at which the intake must have completed its configured turn.
     pub lift_rotated_degrees: f64,
     pub pivot_home_degrees: f64,
-    /// Upward target offset at the intake output; does not change sensor zero.
-    pub pivot_alignment_output_degrees: f64,
     /// Intake rotation at the driven gear, measured from its stowed orientation.
     pub pivot_travel_output_degrees: f64,
-    /// Positive motor revolutions per one output revolution, including external gearing.
-    pub pivot_motor_per_output_rev: f64,
+    /// Positive P8 sensor revolutions per output revolution, including external gearing.
+    pub pivot_sensor_per_output_rev: f64,
 }
 
 impl Calibration {
@@ -98,24 +89,29 @@ impl Calibration {
             self.lift_top_degrees,
             self.lift_rotated_degrees,
             self.pivot_home_degrees,
-            self.pivot_alignment_output_degrees,
             self.pivot_travel_output_degrees,
-            self.pivot_motor_per_output_rev,
+            self.pivot_sensor_per_output_rev,
             self.pivot_home_degrees
-                + self.pivot_travel_output_degrees * self.pivot_motor_per_output_rev,
+                + self.pivot_travel_output_degrees * self.pivot_sensor_per_output_rev,
         ]
         .iter()
         .all(|value| value.is_finite())
             && self.lift_bottom_degrees < self.lift_rotated_degrees
             && self.lift_rotated_degrees <= self.lift_upper_limit()
-            && (0.0..=self.pivot_travel_output_degrees)
-                .contains(&self.pivot_alignment_output_degrees)
             && self.pivot_travel_output_degrees > 0.0
-            && self.pivot_motor_per_output_rev > 0.0
+            && self.pivot_travel_output_degrees <= 90.0
+            && self.pivot_sensor_per_output_rev > 0.0
     }
 
     pub fn lift_upper_limit(self) -> f64 {
         (self.lift_top_degrees - LIFT_TOP_CLEARANCE_DEGREES).min(LIFT_MAXIMUM_DEGREES)
+    }
+
+    /// P8 endpoint, including any extra travel beyond normal placement.
+    pub fn pivot_limit(self, extra_output_degrees: f64) -> f64 {
+        self.pivot_home_degrees
+            + (self.pivot_travel_output_degrees + extra_output_degrees)
+                * self.pivot_sensor_per_output_rev
     }
 
     pub fn pivot_target(self, lift_degrees: f64) -> f64 {
@@ -123,9 +119,7 @@ impl Calibration {
             / (self.lift_rotated_degrees - self.lift_bottom_degrees))
             .clamp(0.0, 1.0);
         self.pivot_home_degrees
-            + (self.pivot_travel_output_degrees * progress + self.pivot_alignment_output_degrees)
-                .min(self.pivot_travel_output_degrees)
-                * self.pivot_motor_per_output_rev
+            + self.pivot_travel_output_degrees * progress * self.pivot_sensor_per_output_rev
     }
 }
 
@@ -137,7 +131,7 @@ pub fn limit_lift_command(calibration: Calibration, position: f64, command: f64)
     }
     if command > 0.0 {
         let remaining = calibration.lift_upper_limit() - position;
-        if remaining <= 0.0 {
+        if remaining <= LIFT_ENDPOINT_TOLERANCE_DEGREES {
             return 0.0;
         }
         let progress = (remaining / LIFT_UP_SLOWDOWN_DEGREES).clamp(0.0, 1.0);
@@ -147,7 +141,7 @@ pub fn limit_lift_command(calibration: Calibration, position: f64, command: f64)
         )
     } else if command < 0.0 {
         let remaining = position - calibration.lift_bottom_degrees;
-        if remaining <= 0.0 {
+        if remaining <= LIFT_ENDPOINT_TOLERANCE_DEGREES {
             return 0.0;
         }
         let progress = (remaining / LIFT_DOWN_SLOWDOWN_DEGREES).clamp(0.0, 1.0);
@@ -164,7 +158,6 @@ pub fn limit_lift_command(calibration: Calibration, position: f64, command: f64)
 pub struct Plan {
     pub lift_direction: i8,
     pub pivot_target_degrees: f64,
-    pub intake_direction: i8,
 }
 
 /// Fails closed on invalid calibration or encoder values. Actual encoder positions,
@@ -174,23 +167,22 @@ pub fn plan(
     lift_degrees: f64,
     pivot_degrees: f64,
     lift_request: i8,
-    intake_request: i8,
 ) -> Option<Plan> {
     if !calibration.valid() || !lift_degrees.is_finite() || !pivot_degrees.is_finite() {
         return None;
     }
     let target = calibration.pivot_target(lift_degrees);
     let mut lift_direction = lift_request.signum();
-    if (lift_direction > 0 && lift_degrees >= calibration.lift_upper_limit())
-        || (lift_direction < 0 && lift_degrees <= calibration.lift_bottom_degrees)
+    if (lift_direction > 0
+        && lift_degrees >= calibration.lift_upper_limit() - LIFT_ENDPOINT_TOLERANCE_DEGREES)
+        || (lift_direction < 0
+            && lift_degrees <= calibration.lift_bottom_degrees + LIFT_ENDPOINT_TOLERANCE_DEGREES)
     {
         lift_direction = 0;
     }
-    let intake_direction = intake_request.signum();
     Some(Plan {
         lift_direction,
         pivot_target_degrees: target,
-        intake_direction,
     })
 }
 
@@ -205,9 +197,8 @@ mod tests {
             lift_top_degrees: 620.0,
             lift_rotated_degrees: 420.0,
             pivot_home_degrees: 10.0,
-            pivot_alignment_output_degrees: 0.0,
             pivot_travel_output_degrees: 90.0,
-            pivot_motor_per_output_rev: 2.0,
+            pivot_sensor_per_output_rev: 2.0,
         }
     }
 
@@ -271,7 +262,7 @@ mod tests {
         for (lift, pivot) in [(20.0, 10.0), (220.0, 100.0), (420.0, 190.0), (620.0, 190.0)] {
             for direction in [-1, 0, 1] {
                 assert_eq!(
-                    plan(c, lift, pivot, direction, 0)
+                    plan(c, lift, pivot, direction)
                         .unwrap()
                         .pivot_target_degrees,
                     pivot
@@ -283,34 +274,12 @@ mod tests {
     }
 
     #[test]
-    fn intake_controls_work_at_any_lift_and_pivot_position() {
-        let c = calibration();
-        for intake in [-1, 0, 1] {
-            assert_eq!(
-                plan(c, 20.0, 10.0, 0, intake).unwrap().intake_direction,
-                intake
-            );
-        }
-        for (lift, pivot, request) in [
-            (30.0, 10.0, 0),
-            (20.0, 30.0, 0),
-            (620.0, 190.0, 0),
-            (20.0, 10.0, 1),
-            (20.0, 10.0, -1),
-            (0.0, 10.0, 0),
-        ] {
-            let output = plan(c, lift, pivot, request, 1).unwrap();
-            assert_eq!(output.intake_direction, 1);
-        }
-    }
-
-    #[test]
     fn endpoints_block_outward_travel_but_allow_return() {
         let c = calibration();
-        assert_eq!(plan(c, 620.0, 190.0, 1, 0).unwrap().lift_direction, 0);
-        assert_eq!(plan(c, 620.0, 190.0, -1, 0).unwrap().lift_direction, -1);
-        assert_eq!(plan(c, 20.0, 10.0, -1, 0).unwrap().lift_direction, 0);
-        assert_eq!(plan(c, 20.0, 10.0, 1, 0).unwrap().lift_direction, 1);
+        assert_eq!(plan(c, 620.0, 190.0, 1).unwrap().lift_direction, 0);
+        assert_eq!(plan(c, 620.0, 190.0, -1).unwrap().lift_direction, -1);
+        assert_eq!(plan(c, 20.0, 10.0, -1).unwrap().lift_direction, 0);
+        assert_eq!(plan(c, 20.0, 10.0, 1).unwrap().lift_direction, 1);
     }
 
     #[test]
@@ -318,7 +287,7 @@ mod tests {
         let c = calibration();
         for direction in [-1, 1] {
             for pivot in [10.0, 80.0, 100.0, 120.0, 190.0] {
-                let output = plan(c, 220.0, pivot, direction, 0).unwrap();
+                let output = plan(c, 220.0, pivot, direction).unwrap();
                 assert_eq!(output.lift_direction, direction);
                 assert_eq!(output.pivot_target_degrees, 100.0);
             }
@@ -354,11 +323,11 @@ mod tests {
                 ..c
             },
             Calibration {
-                pivot_motor_per_output_rev: 0.0,
+                pivot_sensor_per_output_rev: 0.0,
                 ..c
             },
             Calibration {
-                pivot_motor_per_output_rev: -1.0,
+                pivot_sensor_per_output_rev: -1.0,
                 ..c
             },
             Calibration {
@@ -366,10 +335,10 @@ mod tests {
                 ..c
             },
         ] {
-            assert!(plan(invalid, 20.0, 10.0, 1, 1).is_none());
+            assert!(plan(invalid, 20.0, 10.0, 1).is_none());
         }
-        assert!(plan(c, f64::NAN, 10.0, 1, 1).is_none());
-        assert!(plan(c, 20.0, f64::INFINITY, 1, 1).is_none());
+        assert!(plan(c, f64::NAN, 10.0, 1).is_none());
+        assert!(plan(c, 20.0, f64::INFINITY, 1).is_none());
     }
 
     fn cascade_calibration() -> Calibration {
@@ -378,9 +347,8 @@ mod tests {
             lift_top_degrees: 1800.0,
             lift_rotated_degrees: 135.0 * 360.0 / 145.0,
             pivot_home_degrees: 0.0,
-            pivot_alignment_output_degrees: 0.0,
             pivot_travel_output_degrees: 90.0,
-            pivot_motor_per_output_rev: 48.0 / 12.0,
+            pivot_sensor_per_output_rev: 48.0 / 12.0,
         }
     }
 
@@ -395,7 +363,7 @@ mod tests {
         assert_eq!(c.pivot_target(c.lift_rotated_degrees), 360.0);
         for direction in [-1, 0, 1] {
             assert!(
-                (plan(c, 135.0, 145.0, direction, 0)
+                (plan(c, 135.0, 145.0, direction)
                     .unwrap()
                     .pivot_target_degrees
                     - 145.0)
@@ -432,7 +400,7 @@ mod tests {
             let mut pivot = c.pivot_target(lift);
             let mut reached_end = false;
             for _ in 0..1000 {
-                let output = plan(c, lift, pivot, direction, 0).unwrap();
+                let output = plan(c, lift, pivot, direction).unwrap();
                 assert_eq!(output.lift_direction, direction);
                 lift += f64::from(direction) * 540.0 * 0.01;
                 pivot += (output.pivot_target_degrees - pivot).clamp(-3.6, 3.6);
@@ -449,12 +417,12 @@ mod tests {
     fn upward_power_tapers_before_software_stop_without_increasing_small_commands() {
         let c = cascade_calibration();
         assert_eq!(limit_lift_command(c, 500.0, 1.0), 1.0);
-        assert_eq!(limit_lift_command(c, 1000.0, 1.0), 1.0);
-        assert!((limit_lift_command(c, 1050.0, 1.0) - 0.56).abs() < 1e-12);
-        assert!((limit_lift_command(c, 1099.0, 1.0) - 0.1288).abs() < 1e-12);
-        assert_eq!(limit_lift_command(c, 1099.0, 0.05), 0.05);
+        assert_eq!(limit_lift_command(c, 900.0, 1.0), 1.0);
+        assert!((limit_lift_command(c, 925.0, 1.0) - 0.56).abs() < 1e-12);
+        assert!((limit_lift_command(c, 949.0, 1.0) - 0.1376).abs() < 1e-12);
+        assert_eq!(limit_lift_command(c, 949.0, 0.05), 0.05);
         let mut previous = 1.0;
-        for position in 1000..=1800 {
+        for position in 900..=1800 {
             let command = limit_lift_command(c, f64::from(position), 1.0);
             assert!(command >= 0.0 && command <= previous);
             previous = command;
@@ -464,12 +432,12 @@ mod tests {
     #[test]
     fn software_stop_blocks_ascent_before_hard_stop_but_allows_descent() {
         let c = cascade_calibration();
-        assert_eq!(c.lift_upper_limit(), 1100.0);
-        for position in [1100.0, 1101.0, 1770.0, 1800.0, 1850.0] {
+        assert_eq!(c.lift_upper_limit(), 950.0);
+        for position in [950.0, 951.0, 1770.0, 1800.0, 1850.0] {
             assert_eq!(limit_lift_command(c, position, 0.75), 0.0);
-            assert_eq!(plan(c, position, 360.0, 1, 0).unwrap().lift_direction, 0);
+            assert_eq!(plan(c, position, 360.0, 1).unwrap().lift_direction, 0);
             assert_eq!(limit_lift_command(c, position, -1.0), -0.35);
-            assert_eq!(plan(c, position, 360.0, -1, 0).unwrap().lift_direction, -1);
+            assert_eq!(plan(c, position, 360.0, -1).unwrap().lift_direction, -1);
         }
     }
 
