@@ -5,8 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-ozton = { path = "../ozton/packages/ozton", version = "0.4.0", default-features = false, features = ["control", "drivetrain", "record"] }
-vexide = { version = "=0.9.0-alpha.1", features = ["full", "default-sdk"] }
+ozton = { path = "../ozton/packages/ozton", default-features = false, features = ["control", "drivetrain", "record"] }
+vexide = { version = "0.9.0-beta.1", features = ["full", "default-sdk"] }
 
 [package.metadata.v5]
 upload-strategy = "differential"

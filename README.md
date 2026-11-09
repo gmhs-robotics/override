@@ -1,6 +1,6 @@
 # Override competition robot
 
-Modular V5 competition program using local ozton 0.4.0 and vexide 0.9 alpha.
+Modular V5 competition program using local ozton and vexide 0.9.0-beta.1.
 All robot tuning and wiring lives in `src/config.rs`. The existing ports, motor
 cartridges, directions, drive scaling and anti-tip settings are preserved.
 

@@ -438,34 +438,9 @@ async fn control_loop(mut robot: Robot, mut store: recording::RouteStore) -> ! {
     }
 }
 
-// Match vexide's default code signature and startup, without the entrypoint
-// macro's generated `Peripherals::take().unwrap()`.
-#[cfg_attr(target_os = "vexos", unsafe(link_section = ".code_signature"))]
-#[used]
-#[unsafe(no_mangle)]
-static __VEXIDE_CODE_SIGNATURE: vexide::program::CodeSignature =
-    vexide::program::CodeSignature::new(
-        vexide::program::ProgramType::User,
-        vexide::program::ProgramOwner::Partner,
-        vexide::program::ProgramOptions::empty(),
-    );
-
-fn main() {
-    // SAFETY: Called once at the program entrypoint, before using VEX devices.
-    unsafe { vexide::startup::startup() };
-    #[cfg(debug_assertions)]
-    vexide::startup::banner::print(vexide::startup::banner::themes::THEME_DEFAULT);
-    vexide::runtime::block_on(async {
-        loop {
-            if let Some(peripherals) = Peripherals::take() {
-                run(peripherals).await;
-            }
-            sleep(CONTROL_INTERVAL).await;
-        }
-    });
-}
-
-async fn run(peripherals: Peripherals) {
+#[cfg_attr(debug_assertions, vexide::main)]
+#[cfg_attr(not(debug_assertions), vexide::main(banner(enabled = false)))]
+async fn main(peripherals: Peripherals) {
     diagnostics::event!(
         "boot,log_schema=1,build=debug,period_ms={},wheel_dia_m={:.6},drive_scale={:.3},wheel_per_motor_11w={:.6},wheel_per_motor_5w={:.6},pivot_sensor_per_output={:.3},lift_max_deg={:.3},pivot_normal_deg={:.3},forward_m={:.4},retreat_m={:.4}",
         DEBUG_SAMPLE_INTERVAL.as_millis(),
